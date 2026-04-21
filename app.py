@@ -103,6 +103,20 @@ SERVICES = [
 _cache = {"data": None, "ts": 0}
 CACHE_TTL = 60  # seconds
 
+# ── Metrics tracking (init after SERVICES defined) ────────────────────────
+_metrics_history = {}
+_incident_log = []
+
+for svc in SERVICES:
+    _metrics_history[svc["id"]] = {
+        "latencies": [],
+        "uptime_seconds": 0,
+        "downtime_seconds": 0,
+        "last_check": None,
+        "last_status": "online"
+    }
+CACHE_TTL = 60  # seconds
+
 def ping_url(url, timeout=8, max_retries=2):
     """Return (status, latency_ms) for a URL with retry logic."""
     if not url or "github.com" in url:
@@ -171,6 +185,35 @@ def fetch_github_commits(repo, n=5):
             })
         return commits
     except Exception:
+        return []
+
+def fetch_all_github_repos():
+    """Fetch ALL repos for the GitHub user."""
+    if not GITHUB_TOKEN:
+        return []
+    try:
+        url = f"https://api.github.com/users/{GITHUB_USER}/repos?per_page=100&sort=pushed"
+        r = httpx.get(url, headers=github_headers(), timeout=15)
+        if r.status_code != 200:
+            return []
+        repos = []
+        for d in r.json():
+            repos.append({
+                "name": d.get("name"),
+                "full_name": d.get("full_name"),
+                "description": d.get("description"),
+                "url": d.get("html_url"),
+                "stars": d.get("stargazers_count", 0),
+                "forks": d.get("forks_count", 0),
+                "language": d.get("language"),
+                "pushed_at": d.get("pushed_at"),
+                "created_at": d.get("created_at"),
+                "default_branch": d.get("default_branch"),
+                "size_kb": d.get("size"),
+            })
+        return repos
+    except Exception as e:
+        print(f"[REPOS ERROR] {e}")
         return []
 
 def fetch_github_repo_meta(repo):
@@ -282,13 +325,23 @@ def send_discord_alert(service_name, old_status, new_status, url):
 
 def check_and_alert(svc_id, old_status, new_status, url):
     """Check if status changed and send alert."""
-    global _previous_state
+    global _previous_state, _incident_log
 
     current_stored = _previous_state.get(svc_id, "online")
 
     if new_status != current_stored:
         send_discord_alert(svc_id, current_stored, new_status, url)
         _previous_state[svc_id] = new_status
+
+        _incident_log.append({
+            "service_id": svc_id,
+            "old_status": current_stored,
+            "new_status": new_status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "url": url
+        })
+        if len(_incident_log) > 100:
+            _incident_log[:] = _incident_log[-100:]
 
 def build_payload():
     """Build the full status payload. Called every CACHE_TTL seconds."""
@@ -316,6 +369,19 @@ def build_payload():
             "vercel_deploys": vercel_deploys,
             "checked_at":     now,
         })
+
+        if svc["id"] in _metrics_history:
+            m = _metrics_history[svc["id"]]
+            if m["last_status"] in ("online", "degraded"):
+                m["uptime_seconds"] += CACHE_TTL
+            elif m["last_status"] == "offline":
+                m["downtime_seconds"] += CACHE_TTL
+            m["last_status"] = status
+            m["last_check"] = now
+            if latency:
+                m["latencies"].append(latency)
+                if len(m["latencies"]) > 100:
+                    m["latencies"] = m["latencies"][-100:]
 
     all_commits = fetch_all_commits()
 
@@ -396,6 +462,70 @@ def service_detail(service_id):
         "vercel_deploys": vercel_deploys,
         "checked_at":     datetime.now(timezone.utc).isoformat(),
     })
+
+@app.route("/api/repos")
+def repos():
+    """Get ALL GitHub repos for alpha-1-design."""
+    repos = fetch_all_github_repos()
+    return jsonify({
+        "count": len(repos),
+        "repos": repos,
+        "fetched_at": datetime.now(timezone.utc).isoformat()
+    })
+
+@app.route("/api/metrics")
+def metrics():
+    """Get uptime/latency metrics for all services."""
+    now = datetime.now(timezone.utc).isoformat()
+    metrics_data = []
+    for svc in SERVICES:
+        m = _metrics_history.get(svc["id"], {})
+        lats = m.get("latencies", [])
+        total_up = m.get("uptime_seconds", 0)
+        total_down = m.get("downtime_seconds", 0)
+        total = total_up + total_down
+        uptime_pct = round((total_up / total) * 100) if total > 0 else 100
+
+        metrics_data.append({
+            "service_id": svc["id"],
+            "service_name": svc["name"],
+            "uptime_seconds": total_up,
+            "downtime_seconds": total_down,
+            "uptime_pct": uptime_pct,
+            "latency_ms": {
+                "current": lats[-1] if lats else None,
+                "avg": round(sum(lats) / len(lats)) if lats else None,
+                "min": min(lats) if lats else None,
+                "max": max(lats) if lats else None,
+                "samples": len(lats)
+            },
+            "last_check": m.get("last_check"),
+            "last_status": m.get("last_status", "online")
+        })
+
+    return jsonify({
+        "generated_at": now,
+        "metrics": metrics_data
+    })
+
+@app.route("/api/incidents")
+def incidents():
+    """Get incident log."""
+    return jsonify({
+        "incidents": _incident_log[-50:],
+        "count": len(_incident_log)
+    })
+
+@app.route("/api/refresh", methods=["POST"])
+def manual_refresh():
+    """Manually trigger a cache refresh."""
+    global _cache
+    try:
+        _cache["data"] = build_payload()
+        _cache["ts"] = time.time()
+        return jsonify({"ok": True, "refreshed_at": datetime.now(timezone.utc).isoformat()})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))

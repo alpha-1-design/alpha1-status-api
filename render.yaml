@@ -9,5 +9,7 @@ services:
         sync: false
       - key: VERCEL_TOKEN
         sync: false
-      - key: SECRET_KEY
-        generateValue: true
+      - key: DISCORD_WEBHOOK
+        sync: false
+      - key: ALERT_COOLDOWN
+        value: 300

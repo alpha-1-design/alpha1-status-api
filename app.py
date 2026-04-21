@@ -6,7 +6,8 @@ and pings all services directly.
 ENV VARS REQUIRED (set in Render dashboard):
   GITHUB_TOKEN      — Personal access token (repo scope)
   VERCEL_TOKEN      — Vercel API token
-  SECRET_KEY        — Any random string, used for CORS validation
+  DISCORD_WEBHOOK   — Discord webhook URL for alerts (optional)
+  ALERT_COOLDOWN    — Seconds between alerts (default 300 = 5 min)
 """
 
 import os, time, asyncio, httpx, json
@@ -19,9 +20,14 @@ import threading
 app = Flask(__name__)
 CORS(app)
 
-GITHUB_TOKEN  = os.environ.get("GITHUB_TOKEN", "")
-VERCEL_TOKEN  = os.environ.get("VERCEL_TOKEN", "")
-GITHUB_USER   = "alpha-1-design"
+GITHUB_TOKEN   = os.environ.get("GITHUB_TOKEN", "")
+VERCEL_TOKEN   = os.environ.get("VERCEL_TOKEN", "")
+DISCORD_WEBHOOK = os.environ.get("DISCORD_WEBHOOK", "")
+ALERT_COOLDOWN = int(os.environ.get("ALERT_COOLDOWN", 300))
+GITHUB_USER    = "alpha-1-design"
+
+_previous_state = {}
+_last_alert_time = {}
 
 # ── All services to monitor ──────────────────────────────────────────────────
 SERVICES = [
@@ -97,24 +103,48 @@ SERVICES = [
 _cache = {"data": None, "ts": 0}
 CACHE_TTL = 60  # seconds
 
-def ping_url(url, timeout=8):
-    """Return (status, latency_ms) for a URL."""
+def ping_url(url, timeout=8, max_retries=2):
+    """Return (status, latency_ms) for a URL with retry logic."""
     if not url or "github.com" in url:
         return "github", None
-    try:
-        t0 = time.time()
-        r = httpx.get(url, timeout=timeout, follow_redirects=True)
-        ms = round((time.time() - t0) * 1000)
-        if r.status_code < 400:
-            return "online", ms
-        elif r.status_code < 500:
-            return "degraded", ms
-        else:
-            return "offline", ms
-    except httpx.TimeoutException:
-        return "timeout", None
-    except Exception:
-        return "offline", None
+
+    last_status = "offline"
+    last_latency = None
+    last_error = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            t0 = time.time()
+            r = httpx.get(url, timeout=timeout, follow_redirects=True)
+            ms = round((time.time() - t0) * 1000)
+
+            if r.status_code < 400:
+                return "online", ms
+            elif r.status_code < 500:
+                return "degraded", ms
+            else:
+                last_status = "offline"
+                last_latency = ms
+                break
+
+        except httpx.TimeoutException:
+            last_status = "timeout"
+            last_error = "timeout"
+        except httpx.ConnectError as e:
+            last_status = "offline"
+            last_error = f"connection error: {e}"
+        except httpx.DNSError as e:
+            last_status = "offline"
+            last_error = f"DNS error: {e}"
+        except Exception as e:
+            last_status = "offline"
+            last_error = str(e)
+
+        if attempt < max_retries:
+            wait_time = (attempt + 1) * 2
+            time.sleep(wait_time)
+
+    return last_status, last_latency
 
 def github_headers():
     h = {"Accept": "application/vnd.github+json"}
@@ -193,9 +223,72 @@ def fetch_all_commits():
         for c in commits:
             c["repo"] = repo
             all_commits.append(c)
-    # Sort by date
     all_commits.sort(key=lambda x: x.get("date", ""), reverse=True)
     return all_commits[:15]
+
+def send_discord_alert(service_name, old_status, new_status, url):
+    """Send alert to Discord webhook when service status changes."""
+    global _last_alert_time
+
+    if not DISCORD_WEBHOOK:
+        return
+
+    alert_key = f"{service_name}_{new_status}"
+    now = time.time()
+
+    if _last_alert_time.get(alert_key, 0) > now - ALERT_COOLDOWN:
+        return
+
+    _last_alert_time[alert_key] = now
+
+    if new_status == "offline":
+        color = 16711680
+        emoji = "🔴"
+        title = f"SERVICE DOWN"
+        description = f"**{service_name}** is now **OFFLINE**"
+    elif new_status == "online" and old_status in ("offline", "degraded"):
+        color = 65280
+        emoji = "🟢"
+        title = "SERVICE RECOVERED"
+        description = f"**{service_name}** is back **ONLINE**"
+    elif new_status == "degraded":
+        color = 16776960
+        emoji = "🟡"
+        title = "SERVICE DEGRADED"
+        description = f"**{service_name}** is running **DEGRADED**"
+    else:
+        return
+
+    payload = {
+        "embeds": [{
+            "title": f"{emoji} {title}",
+            "description": description,
+            "color": color,
+            "fields": [
+                {"name": "URL", "value": url, "inline": True},
+                {"name": "Previous", "value": old_status.title(), "inline": True},
+                {"name": "Current", "value": new_status.title(), "inline": True},
+            ],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "footer": {"text": "Alpha-1 Status Monitor"}
+        }]
+    }
+
+    try:
+        httpx.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        print(f"[ALERT] {service_name}: {old_status} → {new_status}")
+    except Exception as e:
+        print(f"[ALERT ERROR] Failed to send Discord alert: {e}")
+
+def check_and_alert(svc_id, old_status, new_status, url):
+    """Check if status changed and send alert."""
+    global _previous_state
+
+    current_stored = _previous_state.get(svc_id, "online")
+
+    if new_status != current_stored:
+        send_discord_alert(svc_id, current_stored, new_status, url)
+        _previous_state[svc_id] = new_status
 
 def build_payload():
     """Build the full status payload. Called every CACHE_TTL seconds."""
@@ -204,6 +297,9 @@ def build_payload():
 
     for svc in SERVICES:
         status, latency = ping_url(svc["url"])
+
+        check_and_alert(svc["id"], _previous_state.get(svc["id"], "online"), status, svc["url"])
+
         repo_meta       = fetch_github_repo_meta(svc["repo"])
         commits         = fetch_github_commits(svc["repo"], n=3)
         vercel_deploys  = []

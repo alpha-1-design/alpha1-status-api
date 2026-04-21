@@ -527,6 +527,58 @@ def manual_refresh():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
+def send_weekly_summary():
+    """Send weekly summary to Discord every Sunday."""
+    if not DISCORD_WEBHOOK:
+        return
+
+    now = datetime.now(timezone.utc)
+    if now.weekday() != 6:
+        return
+
+    summary_lines = []
+    total_uptime = 0
+    for svc_id, m in _metrics_history.items():
+        svc_name = next((s["name"] for s in SERVICES if s["id"] == svc_id), svc_id)
+        up = m.get("uptime_seconds", 0)
+        down = m.get("downtime_seconds", 0)
+        total = up + down
+        pct = round((up / total) * 100) if total > 0 else 100
+        total_uptime += pct
+        summary_lines.append(f"**{svc_name}**: {pct}% uptime")
+
+    avg_uptime = round(total_uptime / len(_metrics_history)) if _metrics_history else 0
+
+    payload = {
+        "embeds": [{
+            "title": "📊 WEEKLY STATUS SUMMARY",
+            "description": f"Weekly report for Alpha-1 Studio — {now.strftime('%Y-%m-%d')}",
+            "color": 3447003,
+            "fields": [
+                {"name": "Overall Uptime", "value": f"**{avg_uptime}%**", "inline": True},
+                {"name": "Services Monitored", "value": str(len(_metrics_history)), "inline": True},
+                {"name": "Incidents This Week", "value": str(len(_incident_log)), "inline": True},
+                {"name": "Service Status", "value": "\n".join(summary_lines[:6]), "inline": False},
+            ],
+            "timestamp": now.isoformat(),
+            "footer": {"text": "Alpha-1 Studio"}
+        }]
+    }
+
+    try:
+        httpx.post(DISCORD_WEBHOOK, json=payload, timeout=10)
+        print(f"[WEEKLY] Summary sent to Discord")
+    except Exception as e:
+        print(f"[WEEKLY ERROR] {e}")
+
+def weekly_scheduler():
+    """Check every hour if it's Sunday and send summary."""
+    while True:
+        send_weekly_summary()
+        time.sleep(3600)
+
+threading.Thread(target=weekly_scheduler, daemon=True).start()
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5050))
     app.run(host="0.0.0.0", port=port, debug=False)
